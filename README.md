@@ -71,3 +71,18 @@ Having a lightweight code that handles most of the used features such as tagging
 1.  library.config > The config file
      
 2.  mlibrary.lib > holds thumbnails and SQLite
+     
+
+## Great, what do I need to run it?
+ 
+Knowledge of setting up python. (Or ask someone to make an executable version of this)
+ 
+<br>Interpreter: Python 3.13.2 (tested)<br>Dependencies: PyQ5, opencv-python, Pillow, numpy<br>Computer: Potato should be fine, but if your library contains many items expect slowdowns. Requires a screen, pointing device and a keyboard.<br>Operating system: Any so long as you can install python.
+ 
+
+## Okay, how to use it?
+ 
+
+*   It is designed not to have a guide.
+     
+*   Minimally place the script (or executable) on the same folder where you want to import into the library.
