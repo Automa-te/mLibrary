@@ -41,7 +41,7 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
     QGroupBox, QFormLayout, QStyle, QLayout, QSizePolicy, QToolTip,
     QScrollArea, QFrame, QTextEdit, QInputDialog, QSplitter, QComboBox,
-    QCompleter
+    QCompleter, QGridLayout
 )
 from PyQt5.QtCore import (
     Qt, QTimer, QThread, pyqtSignal, QSize, QPoint, QRect,
@@ -328,18 +328,66 @@ def natural_sort_key(name: str):
     return [int(chunk) if chunk.isdigit() else chunk.lower()
             for chunk in re.split(r'(\d+)', name)]
 
-def thumb_zip(path: str) -> Optional[bytes]:
+def analyze_zip_contents(path: str) -> Tuple[List[bytes], int]:
+    """
+    Reads a zip archive once and returns (thumbnails, item_count):
+      - thumbnails: a single-element list containing the JPEG cover
+        thumbnail (the first top-level image inside the zip, natural-
+        sorted), or [] if the zip has no readable top-level images. Only
+        one is stored — the normal gallery grid's cover is the only
+        consumer; the zip folder preview window extracts and shows every
+        image on demand instead of relying on pre-stored thumbnails, so
+        storing more than one here would just be wasted space in the
+        library file for no reader.
+      - item_count: total number of TOP-LEVEL entries in the zip — a
+        subfolder inside the zip counts as ONE item, its own contents are
+        not counted individually (matches Folder counting below, and the
+        spec: "count the folder but not the child contents").
+    Returns ([], 0) if the zip can't be read at all.
+    """
     try:
         with zipfile.ZipFile(path, 'r') as zf:
-            names = sorted(
-                (n for n in zf.namelist()
-                 if Path(n).suffix.lower() in IMAGE_EXTS),
-                key=natural_sort_key)
-            if not names: return None
-            img = Image.open(_io.BytesIO(zf.read(names[0])))
-            return _pil_to_jpeg(img)
+            names = zf.namelist()
+            top_level_dirs = set()
+            top_level_images = []
+            for n in names:
+                if n.endswith('/'):
+                    continue   # explicit directory entries — handled via prefix below
+                # Determine the top-level component of this path
+                parts = n.split('/', 1)
+                if len(parts) == 1:
+                    # File directly at zip root
+                    if Path(n).suffix.lower() in IMAGE_EXTS:
+                        top_level_images.append(n)
+                else:
+                    # File inside a subfolder — the subfolder itself is
+                    # the "item", its contents don't count separately
+                    top_level_dirs.add(parts[0])
+
+            item_count = len(top_level_dirs) + len([
+                n for n in names if '/' not in n and not n.endswith('/')
+            ])
+
+            top_level_images.sort(key=natural_sort_key)
+            thumbs = []
+            if top_level_images:
+                try:
+                    img = Image.open(_io.BytesIO(zf.read(top_level_images[0])))
+                    data = _pil_to_jpeg(img)
+                    if data:
+                        thumbs.append(data)
+                except Exception:
+                    pass
+            return thumbs, item_count
     except Exception:
-        return None
+        return [], 0
+
+def thumb_zip(path: str) -> Optional[bytes]:
+    """Cover thumbnail only (first top-level image) — kept as a thin
+    wrapper around analyze_zip_contents for callers that only need the
+    single cover image, not the full multi-thumbnail set or item count."""
+    thumbs, _count = analyze_zip_contents(path)
+    return thumbs[0] if thumbs else None
 
 def jpeg_to_qimage(data: bytes) -> Optional[QImage]:
     """Decode JPEG bytes → QImage (thread-safe). Returns None on failure."""
@@ -450,7 +498,8 @@ def placeholder_qimage(w: int, h: int, icon: str, bg: str = CARD_BG) -> QImage:
 # ── Config ────────────────────────────────────────────────────────────────────
 
 class AppConfig:
-    DEFAULTS = {"library_path":"","thumb_scale":"1.0","window_geometry":"","text_scale":"1.0"}
+    DEFAULTS = {"library_path":"","thumb_scale":"1.0","window_geometry":"",
+                "text_scale":"1.0"}
     def __init__(self, path: str):
         self.path = path; self.data = dict(self.DEFAULTS); self.load()
     def load(self):
@@ -482,7 +531,8 @@ class LibraryDB:
         width INTEGER, height INTEGER, duration REAL,
         date_added TEXT, date_modified TEXT,
         is_deleted INTEGER DEFAULT 0, parent_id INTEGER REFERENCES files(id),
-        stars INTEGER DEFAULT 0, hearts INTEGER DEFAULT 0
+        stars INTEGER DEFAULT 0, hearts INTEGER DEFAULT 0,
+        item_count INTEGER
     );
     CREATE TABLE IF NOT EXISTS thumbnails(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -551,12 +601,15 @@ class LibraryDB:
         self.conn.execute("INSERT OR IGNORE INTO meta VALUES('created',?)",
                           (datetime.now().isoformat(),))
 
-        # Phase 2: migrate older libraries created before stars/hearts existed
+        # Phase 2: migrate older libraries created before stars/hearts/
+        # item_count existed
         cols = [r[1] for r in self.conn.execute("PRAGMA table_info(files)")]
         if 'stars' not in cols:
             self.conn.execute("ALTER TABLE files ADD COLUMN stars INTEGER DEFAULT 0")
         if 'hearts' not in cols:
             self.conn.execute("ALTER TABLE files ADD COLUMN hearts INTEGER DEFAULT 0")
+        if 'item_count' not in cols:
+            self.conn.execute("ALTER TABLE files ADD COLUMN item_count INTEGER")
         self.conn.commit()
 
         # Phase 2.5: backfill tag_vocab from any tags already assigned to
@@ -798,16 +851,23 @@ class LibraryDB:
 
     def add_file(self, filename, rel_path, abs_path, file_type,
                  file_size=None, checksum=None, width=None, height=None,
-                 duration=None, date_modified=None, parent_id=None) -> int:
+                 duration=None, date_modified=None, parent_id=None,
+                 item_count=None) -> int:
         now = datetime.now().isoformat()
         cur = self.conn.execute("""
             INSERT OR REPLACE INTO files
             (filename,rel_path,abs_path,file_type,file_size,checksum,
-             width,height,duration,date_added,date_modified,is_deleted,parent_id)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?)""",
+             width,height,duration,date_added,date_modified,is_deleted,parent_id,
+             item_count)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?,?)""",
             (filename,rel_path,abs_path,file_type,file_size,checksum,
-             width,height,duration,now,date_modified,parent_id))
+             width,height,duration,now,date_modified,parent_id,item_count))
         self.conn.commit(); return cur.lastrowid
+
+    def set_item_count(self, fid: int, item_count: Optional[int]):
+        self.conn.execute(
+            "UPDATE files SET item_count=? WHERE id=?", (item_count, fid))
+        self.conn.commit()
 
     def mark_deleted(self, fid: int):
         self.conn.execute("UPDATE files SET is_deleted=1 WHERE id=?", (fid,))
@@ -1097,15 +1157,16 @@ class ImportWorker(QThread):
         elif self.recursive:
             rel = self._rel(dirpath)
             row = self.db.conn.execute(
-                "SELECT id FROM files WHERE rel_path=?", (rel,)).fetchone()
+                "SELECT id, item_count FROM files WHERE rel_path=?", (rel,)).fetchone()
             if row:
                 par = row[0]
-                # Backfill: existing folder row from before this feature
-                # (or otherwise never thumbed) — generate one now.
-                has_thumb = self.db.conn.execute(
-                    "SELECT 1 FROM thumbnails WHERE file_id=? LIMIT 1",
-                    (par,)).fetchone()
-                if not has_thumb:
+                # Backfill: existing folder row from before Focus view
+                # existed. It may already have a frame-0 mosaic thumbnail
+                # from the earlier mosaic-only feature — checking "any
+                # thumbnail present" would wrongly treat that as already
+                # done. item_count being NULL is the reliable signal that
+                # Focus view's data (item_count + frames 1-7) is missing.
+                if row['item_count'] is None:
                     self._generate_folder_thumbnail(par, dirpath, entries)
             else:
                 par = self.db.add_file(
@@ -1123,19 +1184,29 @@ class ImportWorker(QThread):
                 out.append((e.path, par))
 
     def _generate_folder_thumbnail(self, folder_id: int, dirpath, entries):
-        """Build and store a mosaic thumbnail for a newly-created folder
-        row from up to 4 of its direct-child images, natural-sorted."""
+        """
+        Build and store the folder's cover thumbnail: a 2x2 mosaic (up to
+        4 images), used as the normal gallery view's single thumbnail.
+        Also computes and stores item_count: every direct child (file or
+        subfolder) counts as ONE item; a subfolder's own contents are not
+        counted separately (matches the zip counting rule).
+        """
         image_names = sorted(
             (e.name for e in entries
              if not e.is_dir(follow_symlinks=False)
              and Path(e.name).suffix.lower() in IMAGE_EXTS),
             key=natural_sort_key)
+
+        item_count = sum(1 for _ in entries)   # every direct child, file or folder
+        self.db.set_item_count(folder_id, item_count)
+
         if not image_names:
             return
-        image_paths = [os.path.join(dirpath, n) for n in image_names[:4]]
-        data = thumb_folder_mosaic(image_paths)
-        if data:
-            self.db.add_thumbnail(folder_id, 0, data)
+        image_paths = [os.path.join(dirpath, n) for n in image_names]
+
+        mosaic_data = thumb_folder_mosaic(image_paths[:4])
+        if mosaic_data:
+            self.db.add_thumbnail(folder_id, 0, mosaic_data)
 
     def _import_one(self, path, parent_id) -> Optional[int]:
         ext = Path(path).suffix.lower()
@@ -1147,7 +1218,7 @@ class ImportWorker(QThread):
         checksum = md5_file(path)
         ftype = ('image' if ext in IMAGE_EXTS else
                  'video' if ext in VIDEO_EXTS else 'zip')
-        w=h=dur=None; thumbs=[]
+        w=h=dur=None; thumbs=[]; item_count=None
         if ftype=='image':
             try:
                 with Image.open(path) as img:
@@ -1166,21 +1237,20 @@ class ImportWorker(QThread):
                 thumbs=thumb_video(path)
             except Exception: pass
         elif ftype=='zip':
-            b=thumb_zip(path)
-            if b: thumbs=[b]
+            thumbs, item_count = analyze_zip_contents(path)
         dm = datetime.fromtimestamp(stat.st_mtime).isoformat()
         if row:
             fid=row['id']
             self.db.conn.execute("""UPDATE files SET filename=?,abs_path=?,
                 file_size=?,checksum=?,width=?,height=?,duration=?,
-                date_modified=?,is_deleted=0,parent_id=? WHERE id=?""",
+                date_modified=?,is_deleted=0,parent_id=?,item_count=? WHERE id=?""",
                 (os.path.basename(path),path,stat.st_size,checksum,
-                 w,h,dur,dm,parent_id,fid))
+                 w,h,dur,dm,parent_id,item_count,fid))
             self.db.conn.execute("DELETE FROM thumbnails WHERE file_id=?",(fid,))
             self.db.conn.commit()
         else:
             fid=self.db.add_file(os.path.basename(path),rel,path,ftype,
-                stat.st_size,checksum,w,h,dur,dm,parent_id)
+                stat.st_size,checksum,w,h,dur,dm,parent_id,item_count)
         for i,b in enumerate(thumbs): self.db.add_thumbnail(fid,i,b)
         return fid
 
@@ -1281,7 +1351,7 @@ class RescanWorker(QThread):
             # ── Step 2: compare against DB ──────────────────────────────────────
             db_rows = conn.execute(
                 "SELECT id,rel_path,abs_path,checksum,is_deleted,file_type,"
-                "filename,parent_id,file_size,date_modified FROM files "
+                "filename,parent_id,file_size,date_modified,item_count FROM files "
                 "WHERE file_type != 'folder'").fetchall()
             db_by_rel = {r['rel_path']: r for r in db_rows}
 
@@ -1406,6 +1476,16 @@ class RescanWorker(QThread):
                         self._regenerate(conn, existing['id'], abs_path,
                                         existing['file_type'], new_checksum)
                         updated += 1
+                elif existing['file_type'] == 'zip' and existing['item_count'] is None:
+                    # Backfill: this zip's content hasn't changed (so the
+                    # normal update path above never ran), but it predates
+                    # the multi-thumbnail/item_count feature — its
+                    # item_count column is still NULL. Regenerate now so
+                    # existing libraries get Focus view thumbnails and
+                    # counts without needing every file to "change" first.
+                    self._regenerate(conn, existing['id'], abs_path,
+                                    existing['file_type'], existing['checksum'])
+                    updated += 1
 
             # ── Step 4: files in DB but missing on disk ─────────────────────────
             for rel_path, row in db_by_rel.items():
@@ -1458,19 +1538,17 @@ class RescanWorker(QThread):
         elif recursive:
             rel = self._rel(dirpath)
             row = conn.execute(
-                "SELECT id FROM files WHERE rel_path=?", (rel,)).fetchone()
+                "SELECT id, item_count FROM files WHERE rel_path=?", (rel,)).fetchone()
             if row:
                 par = row[0]
-                # Backfill: this folder row already existed (created before
-                # the mosaic-thumbnail feature, or simply not yet thumbed
-                # for some other reason) — generate one now if it's still
-                # missing, so existing libraries get mosaics on their next
-                # rescan rather than only ever getting them for brand-new
-                # folders going forward.
-                has_thumb = conn.execute(
-                    "SELECT 1 FROM thumbnails WHERE file_id=? LIMIT 1",
-                    (par,)).fetchone()
-                if not has_thumb:
+                # Backfill: this folder row already existed. It may already
+                # have a frame-0 mosaic thumbnail from before Focus view
+                # existed — checking "any thumbnail present" would wrongly
+                # skip it, since that's exactly the folder's pre-existing
+                # state. The reliable signal that Focus view's data
+                # (item_count + frames 1-7) hasn't been generated yet is
+                # item_count itself being NULL, so check that instead.
+                if row['item_count'] is None:
                     self._generate_folder_thumbnail(conn, par, dirpath, entries)
             else:
                 now = datetime.now().isoformat()
@@ -1494,23 +1572,31 @@ class RescanWorker(QThread):
                 out[self._rel(e.path)] = (e.path, par)
 
     def _generate_folder_thumbnail(self, conn, folder_id: int, dirpath, entries):
-        """Build and store a mosaic thumbnail for a newly-created folder
-        row from up to 4 of its direct-child images, natural-sorted.
-        Uses the caller's own connection (RescanWorker's thread-local one)."""
+        """
+        Build and store the folder's cover thumbnail (2x2 mosaic, frame 0)
+        — same as ImportWorker._generate_folder_thumbnail. Also
+        (re)computes item_count. Uses the caller's own connection
+        (RescanWorker's thread-local one)."""
         image_names = sorted(
             (e.name for e in entries
              if not e.is_dir(follow_symlinks=False)
              and Path(e.name).suffix.lower() in IMAGE_EXTS),
             key=natural_sort_key)
+
+        item_count = sum(1 for _ in entries)
+        conn.execute("UPDATE files SET item_count=? WHERE id=?", (item_count, folder_id))
+        conn.commit()
+
         if not image_names:
             return
-        image_paths = [os.path.join(dirpath, n) for n in image_names[:4]]
-        data = thumb_folder_mosaic(image_paths)
-        if data:
+        image_paths = [os.path.join(dirpath, n) for n in image_names]
+
+        mosaic_data = thumb_folder_mosaic(image_paths[:4])
+        if mosaic_data:
             conn.execute(
                 "INSERT OR REPLACE INTO thumbnails(file_id,frame_index,data) VALUES(?,0,?)",
-                (folder_id, data))
-            conn.commit()
+                (folder_id, mosaic_data))
+        conn.commit()
 
     def _import_new(self, conn, path: str, rel_path: str, parent_id) -> Optional[int]:
         """Import a file that's on disk but has no DB row at all yet."""
@@ -1522,7 +1608,7 @@ class RescanWorker(QThread):
         checksum = md5_file(path)
         ftype = ('image' if ext in IMAGE_EXTS else
                  'video' if ext in VIDEO_EXTS else 'zip')
-        w=h=dur=None; thumbs=[]
+        w=h=dur=None; thumbs=[]; item_count=None
         if ftype=='image':
             try:
                 with Image.open(path) as img:
@@ -1541,17 +1627,17 @@ class RescanWorker(QThread):
                 thumbs=thumb_video(path)
             except Exception: pass
         elif ftype=='zip':
-            b=thumb_zip(path)
-            if b: thumbs=[b]
+            thumbs, item_count = analyze_zip_contents(path)
         dm = datetime.fromtimestamp(stat.st_mtime).isoformat()
         now = datetime.now().isoformat()
         cur = conn.execute("""
             INSERT OR IGNORE INTO files
             (filename,rel_path,abs_path,file_type,file_size,checksum,
-             width,height,duration,date_added,date_modified,is_deleted,parent_id)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?)""",
+             width,height,duration,date_added,date_modified,is_deleted,parent_id,
+             item_count)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,0,?,?)""",
             (os.path.basename(path),rel_path,path,ftype,stat.st_size,checksum,
-             w,h,dur,now,dm,parent_id))
+             w,h,dur,now,dm,parent_id,item_count))
         conn.commit()
         fid = cur.lastrowid
         if not fid:
@@ -1575,7 +1661,7 @@ class RescanWorker(QThread):
             return
         if checksum is None:
             checksum = md5_file(path)
-        w=h=dur=None; thumbs=[]
+        w=h=dur=None; thumbs=[]; item_count=None
         if ftype=='image':
             try:
                 with Image.open(path) as img:
@@ -1594,12 +1680,11 @@ class RescanWorker(QThread):
                 thumbs=thumb_video(path)
             except Exception: pass
         elif ftype=='zip':
-            b=thumb_zip(path)
-            if b: thumbs=[b]
+            thumbs, item_count = analyze_zip_contents(path)
         dm = datetime.fromtimestamp(stat.st_mtime).isoformat()
         conn.execute("""UPDATE files SET file_size=?,checksum=?,width=?,height=?,
-            duration=?,date_modified=? WHERE id=?""",
-            (stat.st_size,checksum,w,h,dur,dm,fid))
+            duration=?,date_modified=?,item_count=? WHERE id=?""",
+            (stat.st_size,checksum,w,h,dur,dm,item_count,fid))
         conn.execute("DELETE FROM thumbnails WHERE file_id=?", (fid,))
         for i,b in enumerate(thumbs):
             conn.execute(
@@ -2702,6 +2787,26 @@ class GalleryCanvas(QAbstractScrollArea):
             p.drawText(QRect(bx, by, self._badge_r, self._badge_r),
                        Qt.AlignCenter, BADGE_ICONS.get(ftype,'?'))
 
+            # ── Item count badge (zip/folder only) ──────────────────────────────
+            # Bottom-left corner, opposite the type badge — shows how many
+            # top-level items are inside without needing to open it.
+            item_count = row['item_count'] if 'item_count' in row.keys() else None
+            if ftype in ('zip', 'folder') and item_count:
+                count_text = str(item_count) if item_count < 1000 else "999+"
+                fm_badge = QFontMetrics(self._font_badge)
+                text_w = fm_badge.horizontalAdvance(count_text)
+                pad = 5
+                pill_w = text_w + pad*2
+                pill_h = self._badge_r
+                px = vx + CELL_PAD//2 + 3
+                py = vy + CELL_PAD//2 + cs - pill_h - 3
+                p.setBrush(QBrush(QColor(0, 0, 0, 170)))
+                p.setPen(Qt.NoPen)
+                p.drawRoundedRect(QRect(px, py, pill_w, pill_h), pill_h//2, pill_h//2)
+                p.setPen(QColor('white'))
+                p.setFont(self._font_badge)
+                p.drawText(QRect(px, py, pill_w, pill_h), Qt.AlignCenter, count_text)
+
             # ── Ratings row (stars top-left, hearts top-right) ─────────────────
             stars  = row['stars']  or 0
             hearts = row['hearts'] or 0
@@ -2976,6 +3081,7 @@ class GalleryCanvas(QAbstractScrollArea):
     def _clear_sel(self):
         self._selected.clear()
         self.selection_changed.emit([])
+
 
 # ── Bulk tag assignment dialog ────────────────────────────────────────────────
 
@@ -5062,15 +5168,21 @@ class ZipFolderDialog(QDialog):
     Opens a zip "like a folder" (per spec) — a grid of its images, streamed
     in progressively via ZipThumbLoader. Double-clicking any page opens
     ZipReaderDialog for full-page reading, starting at that page.
-    This never touches the library database — purely a temp-extraction
-    browse view, matching the "won't touch library data" requirement.
+
+    Also shows a Tags panel (existing tags + search-and-add box) for the
+    zip file itself, when db/file_id are provided — this is the only
+    library-database interaction the dialog performs; browsing/extraction
+    of the zip's own contents still never touches the library.
     """
 
     MIN_ZOOM_PCT, MAX_ZOOM_PCT, DEFAULT_ZOOM_PCT = 50, 300, 100
 
-    def __init__(self, zip_path: str, zip_filename: str, parent=None):
+    def __init__(self, zip_path: str, zip_filename: str, parent=None,
+                 db: Optional[LibraryDB] = None, file_id: Optional[int] = None):
         super().__init__(parent)
         self.zip_path = zip_path
+        self.db = db
+        self.file_id = file_id
         self.setWindowTitle(zip_filename)
         self.setMinimumSize(900, 650)
         self.setStyleSheet(build_app_style(UI_TEXT_SCALE))
@@ -5088,6 +5200,8 @@ class ZipFolderDialog(QDialog):
 
         self._build_ui(zip_filename)
         self._start_loading()
+        if self.db and self.file_id is not None:
+            self._refresh_tags()
 
     def _zoom_px(self, pct: int) -> int:
         return max(1, int(ZipPageThumb.DEFAULT_SIZE * pct / 100))
@@ -5127,6 +5241,33 @@ class ZipFolderDialog(QDialog):
         self.grid = FlowGridLayout(self.container, h_spacing=10, v_spacing=10, margin=14)
         self.scroll.setWidget(self.container)
         outer.addWidget(self.scroll, 1)
+
+        # Tags panel — only meaningful when this dialog knows which library
+        # file it's showing (db + file_id supplied); otherwise stays hidden
+        # since there'd be nothing to read or write tags against.
+        self.tag_group = QGroupBox("Tags")
+        tg = QVBoxLayout(self.tag_group)
+        self.tag_flow_container = QWidget()
+        self.tag_flow = FlowGridLayout(self.tag_flow_container, h_spacing=6, v_spacing=6, margin=4)
+        tg.addWidget(self.tag_flow_container)
+
+        add_row = QHBoxLayout()
+        self.tag_search_edit = QLineEdit()
+        self.tag_search_edit.setPlaceholderText("Type to search and add tags")
+        add_row.addWidget(self.tag_search_edit, 1)
+        add_btn = QPushButton("Add")
+        add_btn.setObjectName("accent")
+        add_btn.clicked.connect(self._on_add_tag_clicked)
+        add_row.addWidget(add_btn)
+        tg.addLayout(add_row)
+        outer.addWidget(self.tag_group)
+
+        if self.db and self.file_id is not None:
+            self._tag_completer = TagFragmentCompleter(
+                self.tag_search_edit, lambda: self.db.get_all_tag_categories(), self)
+            self.tag_search_edit.returnPressed.connect(self._on_add_tag_clicked)
+        else:
+            self.tag_group.setVisible(False)
 
         bottom = QWidget()
         bottom.setStyleSheet(f"background:{PANEL_BG}; border-top:1px solid {BORDER};")
@@ -5211,6 +5352,88 @@ class ZipFolderDialog(QDialog):
             QMessageBox.information(self, "No Images", "This zip has no images to read.")
             return
         ZipReaderDialog(paths, start_index=0, parent=self).exec_()
+
+    # ── Tags panel ────────────────────────────────────────────────────────────
+
+    def _refresh_tags(self):
+        self.tag_flow.clear()
+        for cat, sub in self.db.get_tags(self.file_id):
+            box = _ZipTagBox(cat, sub)
+            box.delete_requested.connect(self._on_delete_tag_requested)
+            self.tag_flow.addWidget(box)
+
+    def _on_delete_tag_requested(self, tag: Tuple[str, str]):
+        cat, sub = tag
+        reply = QMessageBox.question(
+            self, "Delete Tag",
+            f"Remove '{cat}: {sub}' from this item?",
+            QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+        current = [t for t in self.db.get_tags(self.file_id) if t != tag]
+        self.db.set_tags(self.file_id, current)
+        self._refresh_tags()
+
+    def _on_add_tag_clicked(self):
+        text = self.tag_search_edit.text().strip()
+        if not text:
+            return
+        # Accept one or more comma-separated "category: subcategory" entries,
+        # same syntax as everywhere else tags are typed in this app.
+        added_any = False
+        for part in [p.strip() for p in text.split(',') if p.strip()]:
+            if ':' not in part:
+                continue
+            cat, sub = part.split(':', 1)
+            cat, sub = cat.strip(), sub.strip()
+            if not cat or not sub:
+                continue
+            self.db.bulk_assign_tag([self.file_id], cat, sub)
+            added_any = True
+        if added_any:
+            self.tag_search_edit.clear()
+            self._refresh_tags()
+        else:
+            QMessageBox.information(
+                self, "Format", "Enter tags as 'category: subcategory', comma-separated.")
+
+# ── Zip folder dialog: tag box (plain, right-click to delete) ────────────────
+
+class _ZipTagBox(QFrame):
+    """
+    One 'Category: subcategory' box in ZipFolderDialog's Tags panel. Plain
+    rectangle, no visible close icon — deletion is via right-click, which
+    asks for confirmation, matching the per-item Tag Editor's spirit but
+    inline rather than in a separate dialog.
+    """
+    delete_requested = pyqtSignal(tuple)   # (category, subcategory)
+
+    def __init__(self, category: str, subcategory: str, parent=None):
+        super().__init__(parent)
+        self.tag = (category, subcategory)
+        self.setStyleSheet(f"""
+            _ZipTagBox {{
+                background: {PANEL_BG};
+                border: 1px solid {BORDER};
+                border-radius: 5px;
+            }}
+            _ZipTagBox:hover {{ border-color: {ACCENT2}; }}
+        """)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lbl = QLabel(f"{category} : {subcategory}")
+        lbl.setStyleSheet(f"color:{TEXT_PRI}; background:transparent;")
+        lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(lbl)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Right-click to remove this tag")
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        del_act = menu.addAction("🗑  Delete Tag")
+        action = menu.exec_(event.globalPos())
+        if action == del_act:
+            self.delete_requested.emit(self.tag)
 
 # ── Progress dialog ───────────────────────────────────────────────────────────
 
@@ -5662,8 +5885,8 @@ class MainWindow(QMainWindow):
         tb.addWidget(organize_btn)
         tb.addSeparator()
 
-        lbl=QLabel("  Size: "); lbl.setStyleSheet(f"color:{TEXT_SEC};background:transparent;")
-        tb.addWidget(lbl)
+        self.size_label=QLabel("  Size: "); self.size_label.setStyleSheet(f"color:{TEXT_SEC};background:transparent;")
+        tb.addWidget(self.size_label)
         self.scale_slider=QSlider(Qt.Horizontal)
         self.scale_slider.setRange(25,200)
         self.scale_slider.setValue(int(float(self.config.get('thumb_scale','1.0'))*100))
@@ -6061,9 +6284,6 @@ class MainWindow(QMainWindow):
 
     def _breadcrumb_nav(self, stack_idx: int):
         self.gallery.jump_to_stack_index(stack_idx)
-        self.breadcrumb.set_path(self.gallery.breadcrumb_path())
-        name=self.gallery._parent_stack[-1][1]
-        self.status_label.setText(f"{name}  |  {len(self.gallery._rows)} items")
 
     # ── Selection ─────────────────────────────────────────────────────────────
 
@@ -6212,7 +6432,7 @@ class MainWindow(QMainWindow):
         if row['file_type'] == 'zip':
             # Double-clicking a zip opens it "like a folder" for reading —
             # file-explorer access moved to the right-click context menu.
-            ZipFolderDialog(path, row['filename'], self).exec_()
+            ZipFolderDialog(path, row['filename'], self, db=self.db, file_id=fid).exec_()
             return
 
         if row['file_type'] == 'image':
